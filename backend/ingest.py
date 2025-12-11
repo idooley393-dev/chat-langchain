@@ -1,20 +1,16 @@
-"""Load html from files, clean up, split, ingest into Weaviate."""
+"""Load Joint Publications PDFs from disk, split, and ingest into Weaviate."""
 
 import logging
 import os
-import re
-from typing import Optional
 
 import weaviate
-from bs4 import BeautifulSoup, SoupStrainer
-from langchain.document_loaders import SitemapLoader
+from langchain.document_loaders import DirectoryLoader, PyPDFLoader
 from langchain.indexes import SQLRecordManager, index
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_weaviate import WeaviateVectorStore
 
 from backend.constants import WEAVIATE_GENERAL_GUIDES_AND_TUTORIALS_INDEX_NAME
 from backend.embeddings import get_embeddings_model
-from backend.parser import langchain_docs_extractor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,99 +20,51 @@ WEAVIATE_API_KEY = os.environ["WEAVIATE_API_KEY"]
 RECORD_MANAGER_DB_URL = os.environ["RECORD_MANAGER_DB_URL"]
 
 
-def metadata_extractor(
-    meta: dict, soup: BeautifulSoup, title_suffix: Optional[str] = None
-) -> dict:
-    title_element = soup.find("title")
-    description_element = soup.find("meta", attrs={"name": "description"})
-    html_element = soup.find("html")
-    title = title_element.get_text() if title_element else ""
-    if title_suffix is not None:
-        title += title_suffix
-
-    return {
-        "source": meta["loc"],
-        "title": title,
-        "description": description_element.get("content", "")
-        if description_element
-        else "",
-        "language": html_element.get("lang", "") if html_element else "",
-        **meta,
-    }
-
-
-def simple_extractor(html: str | BeautifulSoup) -> str:
-    if isinstance(html, str):
-        soup = BeautifulSoup(html, "lxml")
-    elif isinstance(html, BeautifulSoup):
-        soup = html
-    else:
-        raise ValueError(
-            "Input should be either BeautifulSoup object or an HTML string"
-        )
-    return re.sub(r"\n\n+", "\n\n", soup.text).strip()
-
-
 #########################
-# General Guides and Tutorials
+# Joint Publications from local PDFs
 #########################
 
 
-# NOTE: To be deprecated once LangChain docs are migrated to new site.
-def load_langchain_python_docs():
-    return SitemapLoader(
-        "https://python.langchain.com/sitemap.xml",
-        filter_urls=["https://python.langchain.com/"],
-        parsing_function=langchain_docs_extractor,
-        default_parser="lxml",
-        bs_kwargs={
-            "parse_only": SoupStrainer(
-                name=("article", "title", "html", "lang", "content")
-            ),
-        },
-        meta_function=metadata_extractor,
-    ).load()
+def load_joint_publications_from_disk():
+    """
+    Load all PDF files under backend/data (relative to this file).
+    Put your Joint Publications (JP 1, JP 3-0, JP 5-0, etc.) as PDFs in that folder.
+    """
+    # Path to the folder containing your Joint Publication PDFs
+    docs_dir = os.path.join(os.path.dirname(__file__), "data")
 
+    logger.info(f"Loading Joint Publications from: {docs_dir}")
 
-# NOTE: To be deprecated once LangChain docs are migrated to new site.
-def load_langchain_js_docs():
-    return SitemapLoader(
-        "https://js.langchain.com/sitemap.xml",
-        parsing_function=simple_extractor,
-        default_parser="lxml",
-        bs_kwargs={
-            "parse_only": SoupStrainer(
-                name=("article", "title", "html", "lang", "content")
-            )
-        },
-        meta_function=metadata_extractor,
-        filter_urls=["https://js.langchain.com/docs/"],
-    ).load()
+    loader = DirectoryLoader(
+        docs_dir,
+        glob="**/*.pdf",        # recursively load all PDFs
+        loader_cls=PyPDFLoader, # use PyPDFLoader to read PDFs
+    )
+    docs = loader.load()
 
+    # Add helpful metadata such as fileName
+    for d in docs:
+        source = d.metadata.get("source", "")
+        filename = os.path.basename(source) if source else ""
+        d.metadata.setdefault("fileName", filename)
 
-def load_aggregated_docs_site():
-    return SitemapLoader(
-        "https://docs.langchain.com/sitemap.xml",
-        parsing_function=simple_extractor,
-        default_parser="lxml",
-        bs_kwargs={
-            "parse_only": SoupStrainer(
-                name=("article", "title", "html", "lang", "content")
-            )
-        },
-        meta_function=metadata_extractor,
-    ).load()
+    logger.info(f"Loaded {len(docs)} documents from disk.")
+    return docs
 
 
 def ingest_general_guides_and_tutorials():
-    langchain_python_docs = load_langchain_python_docs()
-    langchain_js_docs = load_langchain_js_docs()
-    aggregated_site_docs = load_aggregated_docs_site()
-    return langchain_python_docs + langchain_js_docs + aggregated_site_docs
+    """
+    For your use case, 'general guides and tutorials' now means
+    'all Joint Publication PDFs loaded from disk'.
+    """
+    return load_joint_publications_from_disk()
 
 
 def ingest_docs():
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=4000, chunk_overlap=200)
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=4000,
+        chunk_overlap=200,
+    )
     embedding = get_embeddings_model()
 
     with weaviate.connect_to_weaviate_cloud(
@@ -124,7 +72,7 @@ def ingest_docs():
         auth_credentials=weaviate.classes.init.Auth.api_key(WEAVIATE_API_KEY),
         skip_init_checks=True,
     ) as weaviate_client:
-        # General Guides and Tutorials
+        # Vector store for Joint Publications (re-using the existing index name)
         general_guides_and_tutorials_vectorstore = WeaviateVectorStore(
             client=weaviate_client,
             index_name=WEAVIATE_GENERAL_GUIDES_AND_TUTORIALS_INDEX_NAME,
@@ -132,12 +80,18 @@ def ingest_docs():
             embedding=embedding,
             attributes=["source", "title"],
         )
+
+        # Record manager to keep track of what we've indexed
         record_manager = SQLRecordManager(
             f"weaviate/{WEAVIATE_GENERAL_GUIDES_AND_TUTORIALS_INDEX_NAME}",
             db_url=RECORD_MANAGER_DB_URL,
         )
         record_manager.create_schema()
+
+        # Load your Joint Publications
         general_guides_and_tutorials_docs = ingest_general_guides_and_tutorials()
+
+        # Split into chunks
         docs_transformed = text_splitter.split_documents(
             general_guides_and_tutorials_docs
         )
@@ -145,14 +99,18 @@ def ingest_docs():
             doc for doc in docs_transformed if len(doc.page_content) > 10
         ]
 
-        # We try to return 'source' and 'title' metadata when querying vector store and
-        # Weaviate will error at query time if one of the attributes is missing from a
-        # retrieved document.
+        # Ensure 'source' and 'title' are always present (Weaviate requires them)
         for doc in docs_transformed:
             if "source" not in doc.metadata:
                 doc.metadata["source"] = ""
-            if "title" not in doc.metadata:
-                doc.metadata["title"] = ""
+
+            # If there's no title, fall back to filename or a generic label
+            if "title" not in doc.metadata or not doc.metadata["title"]:
+                source = doc.metadata.get("source", "")
+                filename = os.path.basename(source) if source else ""
+                doc.metadata["title"] = filename or "Joint Publication"
+
+        # Index into Weaviate with record management
         indexing_stats = index(
             docs_transformed,
             record_manager,
@@ -162,6 +120,8 @@ def ingest_docs():
             force_update=(os.environ.get("FORCE_UPDATE") or "false").lower() == "true",
         )
         logger.info(f"Indexing stats: {indexing_stats}")
+
+        # Log how many vectors are in the collection now
         num_vecs = (
             weaviate_client.collections.get(
                 WEAVIATE_GENERAL_GUIDES_AND_TUTORIALS_INDEX_NAME
@@ -170,7 +130,7 @@ def ingest_docs():
             .total_count
         )
         logger.info(
-            f"General Guides and Tutorials now has this many vectors: {num_vecs}",
+            f"General Guides and Tutorials (Joint Publications) now has this many vectors: {num_vecs}",
         )
 
 
